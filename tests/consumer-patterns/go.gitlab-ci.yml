@@ -1,0 +1,17 @@
+# Canonical consumer pattern: single-stack Go service.
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@RC_VERSION
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/pipeline@RC_VERSION
+    inputs:
+      team: smoketest
+      app: svc-go
+      stacks:
+        - name: api
+          language: go
+          paths: ["**"]
+          project_dir: "."
+          test_paths: ["./..."]
+          coverage_threshold: 0
+          image_name: svc-go
+          dockerfile: Dockerfile
+          build_context: "."

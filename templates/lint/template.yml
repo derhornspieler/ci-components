@@ -1,0 +1,129 @@
+---
+# lint — MinimalCD v4.0.0 leaf component
+#
+# Emits one job per language family (python/typescript/go). Each job loops over
+# the declared stacks matching its language and lints each stack dir. No Vault.
+
+spec:
+  inputs:
+    stacks:
+      description: "Structured stack declarations (spec §7)"
+      type: array
+      default: []
+    python_image:
+      description: "Python image with pip (ruff is pip-installed). TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/python:3.12-alpine"
+    node_image:
+      description: "Node image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/node:20-alpine"
+    go_image:
+      description: "Go image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/golang:1.23-alpine"
+    runner_tags:
+      description: "Runner tags for light jobs (lint/test/pre-check/promote/deploy-gates)."
+      type: array
+      default: ["shared"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+
+stages: [lint]
+
+"lint:python":
+  stage: lint
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.python_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq
+    - pip install --quiet ruff
+    - |
+      set -euo pipefail
+      DIRS=$(echo "$STACKS_JSON" | jq -r '.[] | select(.language=="python") | .project_dir')
+      [ -z "$DIRS" ] && { echo "[lint:python] no python stacks, exiting OK"; exit 0; }
+      for d in $DIRS; do
+        echo "::group::lint:python $d"
+        ( cd "$d" && ruff check . && ruff format --check . )
+        echo "::endgroup::"
+      done
+
+"lint:typescript":
+  stage: lint
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.node_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq
+    - |
+      set -euo pipefail
+      DIRS=$(echo "$STACKS_JSON" | jq -r '.[] | select(.language=="typescript") | .project_dir')
+      [ -z "$DIRS" ] && { echo "[lint:typescript] no typescript stacks, exiting OK"; exit 0; }
+      for d in $DIRS; do
+        echo "::group::lint:typescript $d"
+        (
+          cd "$d"
+          if [ -f package-lock.json ]; then
+            npm ci --prefer-offline
+          else
+            echo "[lint:typescript] no package-lock.json in $d, falling back to npm install"
+            npm install --prefer-offline --no-audit --no-fund
+          fi
+          npx eslint .
+          npx prettier --check .
+        )
+        echo "::endgroup::"
+      done
+
+"lint:go":
+  stage: lint
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.go_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq git
+    - go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    - |
+      set -euo pipefail
+      NAMES=$(echo "$STACKS_JSON" | jq -r '.[] | select(.language=="go") | .name')
+      [ -z "$NAMES" ] && { echo "[lint:go] no go stacks, exiting OK"; exit 0; }
+      # Go can have multiple modules; lint from paths
+      PATHS=$(echo "$STACKS_JSON" | jq -r '.[] | select(.language=="go") | .project_dir // "."')
+      for p in $PATHS; do
+        echo "::group::lint:go $p"
+        ( cd "$p" && golangci-lint run ./... )
+        echo "::endgroup::"
+      done

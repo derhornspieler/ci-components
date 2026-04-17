@@ -1,0 +1,137 @@
+---
+# promote — MinimalCD v4.0.0 leaf component
+#
+# Auto-promotes to app-deployments branches:
+#   - promote:dev    on $CI_COMMIT_BRANCH == "dev"
+#   - promote:staged on $CI_COMMIT_BRANCH == "main"
+# Prod promotion is MR flow in app-deployments, not a CI job.
+#
+# Uses _vault-auth .ssh-deploy-key-setup to load the deploy key from
+# platform/ci-robots/app-deployments-deploy, then kustomize edit set image
+# for each stack and git push.
+
+spec:
+  inputs:
+    stacks:
+      description: "Structured stack declarations (spec §7)"
+      type: array
+      default: []
+    team:
+      description: "Team slug (dir in app-deployments)"
+      type: string
+    app:
+      description: "App slug (subdir under team in app-deployments)"
+      type: string
+    app_deployments_repo:
+      description: "SSH URL of the app-deployments repo"
+      type: string
+      default: "git@gitlab.example.com:continuous-delivery/app-deployments.git"
+    kustomize_image:
+      description: "Image with kustomize + git + ssh. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/alpine:3.21"
+    vault_role:
+      description: "Vault JWT role for SSH deploy key"
+      type: string
+      default: "gitlab-ci"
+    runner_tags:
+      description: "Runner tags for light jobs (lint/test/pre-check/promote/deploy-gates)."
+      type: array
+      default: ["shared"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/vault-auth@4.0.14
+    inputs:
+      vault_role: "$[[ inputs.vault_role ]]"
+
+stages: [promote]
+
+".promote-base":
+  image: "$[[ inputs.kustomize_image ]]"
+  variables:
+    TEAM: "$[[ inputs.team ]]"
+    APP: "$[[ inputs.app ]]"
+    APPDEPS_REPO: "$[[ inputs.app_deployments_repo ]]"
+  before_script:
+    - apk add --no-cache git openssh-client curl jq bash tar
+    - |
+      if ! command -v kustomize >/dev/null 2>&1; then
+        curl -sSfL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash -s -- 5.4.3 /usr/local/bin
+      fi
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".vault-auth-jwt", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+    - !reference [".ssh-deploy-key-setup", before_script]
+
+"promote:dev":
+  stage: promote
+  tags: $[[ inputs.runner_tags ]]
+  extends: ".promote-base"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+  needs:
+    - job: "build:image"
+      artifacts: true
+    - job: "scan:sbom-and-sign"
+  variables:
+    TARGET_BRANCH: dev
+  script:
+    - !reference [".promote-script", script]
+
+"promote:staged":
+  stage: promote
+  tags: $[[ inputs.runner_tags ]]
+  extends: ".promote-base"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  needs:
+    - job: "build:image"
+      artifacts: true
+    - job: "scan:sbom-and-sign"
+  variables:
+    TARGET_BRANCH: staged
+  script:
+    - !reference [".promote-script", script]
+
+".promote-script":
+  script:
+    - |
+      bash -euo pipefail <<'BASH'
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      WORK=$(mktemp -d)
+      cd "$WORK"
+      git clone --branch "$TARGET_BRANCH" "$APPDEPS_REPO" app-deployments
+      cd "app-deployments/${TEAM}/${APP}/overlays/${TARGET_BRANCH}"
+
+      LEN=$(echo "$STACKS_JSON" | jq 'length')
+      for i in $(seq 0 $((LEN-1))); do
+        S=$(echo "$STACKS_JSON" | jq ".[$i]")
+        NAME=$(echo "$S"  | jq -r '.name')
+        IMG=$(echo "$S"   | jq -r '.image_name // .name')
+        DIGEST_FILE="${CI_PROJECT_DIR}/digests/${NAME}-digest.txt"
+        [ -f "$DIGEST_FILE" ] || { echo "[promote] missing digest file $DIGEST_FILE"; exit 1; }
+        REF=$(cat "$DIGEST_FILE")
+        echo "[promote] kustomize set image ${IMG}=${REF}"
+        kustomize edit set image "${IMG}=${REF}"
+      done
+
+      git config user.email "ci@example.com"
+      git config user.name  "MinimalCD Bot"
+      git add -A
+      if git diff --cached --quiet; then
+        echo "[promote] no changes, skipping push"
+        exit 0
+      fi
+      git commit -m "promote(${TEAM}/${APP}): ${CI_COMMIT_SHORT_SHA} -> ${TARGET_BRANCH}"
+      git push origin "${TARGET_BRANCH}"
+      BASH

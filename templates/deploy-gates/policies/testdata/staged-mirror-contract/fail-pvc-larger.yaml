@@ -1,0 +1,20 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: staged-forge
+spec:
+  resources:
+    requests:
+      storage: "200Gi"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: forge
+spec:
+  resources:
+    requests:
+      storage: "100Gi"

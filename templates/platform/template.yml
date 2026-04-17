@@ -1,0 +1,342 @@
+---
+# _platform — MinimalCD v4.0.0 shared component
+#
+# Purpose: fetch the platform endpoint map from Vault (platform/cluster-context),
+# provide language-base anchors, rules anchors, artifact schemas, and the
+# package-repo hydration anchor.
+#
+# Chain-included by every leaf component. Does not declare any jobs — only anchors.
+#
+# Consumers never need to redeclare Harbor registry URLs, Vault addr, GitLab
+# base URL, ArgoCD API, or package-repo URLs — they all come from Vault.
+
+spec:
+  inputs:
+    package_repos_override:
+      description: "Map of per-language package-repo overrides, merged on top of Vault cluster-context.package_repos"
+      type: array
+      default: []
+    vault_addr:
+      description: "Fallback Vault address used only if cluster-context fetch fails (bootstrap)"
+      type: string
+      default: "http://vault.vault.svc.cluster.local:8200"
+    vault_role:
+      description: "JWT auth role used for reading platform/cluster-context"
+      type: string
+      default: "gitlab-ci"
+    vault_id_token_aud:
+      description: "OIDC audience for the CI JWT"
+      type: string
+      default: "https://gitlab.example.com"
+    default_tool_image:
+      description: "Generic tool image (jq+curl). TODO ADR-5: pin to sha256:digest"
+      type: string
+      default: "harbor.example.com/docker.io/library/alpine:3.21"
+---
+
+# ============================================================================
+# Rules anchors — consistent trigger conditions across all jobs
+# ============================================================================
+".rules-on-mr-and-main":
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+".rules-on-main-only":
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+".rules-on-dev-only":
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+
+".rules-on-mr-only":
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ============================================================================
+# Artifact schema anchors
+# ============================================================================
+".artifact-scan-reports":
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - scan-reports/
+      - "**/trivy-*.json"
+      - "**/sbom-*.json"
+
+".artifact-test-reports":
+  artifacts:
+    when: always
+    expire_in: 14 days
+    reports:
+      junit: "**/junit-*.xml"
+      coverage_report:
+        coverage_format: cobertura
+        path: "**/coverage.xml"
+    paths:
+      - test-reports/
+      - coverage/
+
+".artifact-gates-reports":
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - gates/
+      - rendered/
+
+# ============================================================================
+# Platform context fetch — call this from any job's before_script
+#
+# Writes /tmp/platform-context.env with these shell-safe variables:
+#   HARBOR_DEV_REGISTRY, HARBOR_PROD_REGISTRY, VAULT_ADDR, VAULT_PUBLIC_ADDR,
+#   VAULT_JWT_AUDIENCE, GITLAB_BASE_URL, ARGOCD_API, COSIGN_VERIFY_KEY_PATH,
+#   PKG_PYPI, PKG_NPM, PKG_GO, PKG_APK_ALPINE, PKG_DEB_DEBIAN, PKG_MAVEN, PKG_HELM
+#
+# Jobs then `source /tmp/platform-context.env` to get endpoints.
+# ============================================================================
+".fetch-platform-context":
+  before_script:
+    - |
+      set -euo pipefail
+      # Install curl + jq across the major base-image package managers.
+      # Required for buildah (Fedora-based, dnf/microdnf), trivy (alpine, apk),
+      # node:*-alpine, python:*-alpine, golang:*-alpine, debian-based images.
+      if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+          apk add --no-cache curl jq >/dev/null 2>&1 || true
+        elif command -v microdnf >/dev/null 2>&1; then
+          microdnf install -y curl jq >/dev/null 2>&1 || true
+        elif command -v dnf >/dev/null 2>&1; then
+          dnf install -y curl jq >/dev/null 2>&1 || true
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update -qq && apt-get install -y -qq curl jq >/dev/null 2>&1 || true
+        fi
+      fi
+      if ! command -v jq >/dev/null 2>&1; then
+        echo "[fetch-platform-context] ERROR: jq not available and no known package manager found"
+        exit 1
+      fi
+
+      VAULT_ADDR="${VAULT_ADDR:-$[[ inputs.vault_addr ]]}"
+      export VAULT_ADDR
+      echo "[fetch-platform-context] VAULT_ADDR=${VAULT_ADDR}"
+
+      # JWT login — CI_JOB_JWT_V2 is provided by GitLab as id_tokens
+      JWT="${CI_JOB_JWT_V2:-${VAULT_ID_TOKEN:-}}"
+      if [ -z "${JWT}" ]; then
+        echo "[fetch-platform-context] ERROR: no JWT available (id_tokens not configured?)"
+        exit 1
+      fi
+
+      LOGIN_PAYLOAD=$(jq -n --arg role "$[[ inputs.vault_role ]]" --arg jwt "${JWT}" '{role:$role, jwt:$jwt}')
+      echo "[fetch-platform-context] attempting vault login as role=$[[ inputs.vault_role ]]"
+      LOGIN_RESP=$(curl -sS -w "\n%{http_code}" --request POST --data "${LOGIN_PAYLOAD}" \
+        "${VAULT_ADDR}/v1/auth/jwt/login" 2>&1) || true
+      HTTP_CODE=$(echo "${LOGIN_RESP}" | tail -1)
+      BODY=$(echo "${LOGIN_RESP}" | sed '$d')
+      echo "[fetch-platform-context] vault login HTTP=${HTTP_CODE}"
+      VAULT_TOKEN=$(echo "${BODY}" | jq -r '.auth.client_token // empty' 2>/dev/null)
+
+      if [ -z "${VAULT_TOKEN}" ]; then
+        echo "[fetch-platform-context] ERROR: vault JWT login failed (HTTP=${HTTP_CODE})"
+        echo "[fetch-platform-context] response: ${BODY:0:300}" >&2
+        exit 1
+      fi
+      export VAULT_TOKEN
+
+      CTX_RESP=$(curl -sS -H "X-Vault-Token: ${VAULT_TOKEN}" \
+        "${VAULT_ADDR}/v1/kv/data/platform/cluster-context" 2>&1) || true
+      CTX=$(echo "${CTX_RESP}" | jq -r '.data.data // empty' 2>/dev/null)
+      if [ -z "${CTX}" ] || [ "${CTX}" = "null" ]; then
+        echo "[fetch-platform-context] ERROR: failed to read platform/cluster-context"
+        echo "[fetch-platform-context] response: ${CTX_RESP:0:300}" >&2
+        exit 1
+      fi
+
+      {
+        echo "export HARBOR_DEV_REGISTRY=$(echo "${CTX}"   | jq -r '.harbor_dev_registry')"
+        echo "export HARBOR_PROD_REGISTRY=$(echo "${CTX}"  | jq -r '.harbor_prod_registry')"
+        echo "export VAULT_ADDR=${VAULT_ADDR}"
+        echo "export VAULT_PUBLIC_ADDR=$(echo "${CTX}"     | jq -r '.vault_public_addr')"
+        echo "export VAULT_JWT_AUDIENCE=$(echo "${CTX}"    | jq -r '.vault_jwt_audience')"
+        echo "export GITLAB_BASE_URL=$(echo "${CTX}"       | jq -r '.gitlab_base_url')"
+        echo "export ARGOCD_API=$(echo "${CTX}"            | jq -r '.argocd_api')"
+        echo "export COSIGN_VERIFY_KEY_PATH=$(echo "${CTX}" | jq -r '.cosign_verify_key_vault_path')"
+        echo "export PKG_PYPI=$(echo "${CTX}"              | jq -r '.package_repos.pypi       | if type=="object" then .url else . end')"
+        echo "export PKG_NPM=$(echo "${CTX}"               | jq -r '.package_repos.npm        | if type=="object" then .url else . end')"
+        echo "export PKG_GO=$(echo "${CTX}"                | jq -r '.package_repos.go         | if type=="object" then .url else . end')"
+        echo "export PKG_APK_ALPINE=$(echo "${CTX}"        | jq -r '.package_repos.apk_alpine | if type=="object" then .url else . end')"
+        echo "export PKG_DEB_DEBIAN=$(echo "${CTX}"        | jq -r '.package_repos.deb_debian | if type=="object" then .url else . end')"
+        echo "export PKG_MAVEN=$(echo "${CTX}"             | jq -r '.package_repos.maven      | if type=="object" then .url else . end')"
+        echo "export PKG_HELM=$(echo "${CTX}"              | jq -r '.package_repos.helm       | if type=="object" then .url else . end')"
+        echo "export VAULT_TOKEN=${VAULT_TOKEN}"
+      } > /tmp/platform-context.env
+      chmod 600 /tmp/platform-context.env
+      echo "[fetch-platform-context] context written to /tmp/platform-context.env"
+
+# ============================================================================
+# Package-repo hydration — writes language-specific config for declared stacks
+# Must run AFTER .fetch-platform-context in the same job
+# ============================================================================
+".hydrate-package-repos":
+  before_script:
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      # Python
+      if [ -n "${PKG_PYPI:-}" ] && [ "${PKG_PYPI}" != "null" ]; then
+        mkdir -p "${HOME}/.config/pip"
+        { echo "[global]"; echo "index-url = ${PKG_PYPI}"; } > "${HOME}/.config/pip/pip.conf"
+        export PIP_INDEX_URL="${PKG_PYPI}"
+      fi
+
+      # npm
+      if [ -n "${PKG_NPM:-}" ] && [ "${PKG_NPM}" != "null" ]; then
+        echo "registry=${PKG_NPM}" > "${HOME}/.npmrc"
+      fi
+
+      # Go
+      if [ -n "${PKG_GO:-}" ] && [ "${PKG_GO}" != "null" ]; then
+        export GOPROXY="${PKG_GO},direct"
+        echo "GOPROXY=${GOPROXY}" >> /tmp/platform-context.env
+      fi
+
+      # Maven
+      if [ -n "${PKG_MAVEN:-}" ] && [ "${PKG_MAVEN}" != "null" ]; then
+        mkdir -p "${HOME}/.m2"
+        printf '%s\n' \
+          '<settings>' \
+          '  <mirrors>' \
+          '    <mirror>' \
+          '      <id>platform-mirror</id>' \
+          "      <url>${PKG_MAVEN}</url>" \
+          '      <mirrorOf>*</mirrorOf>' \
+          '    </mirror>' \
+          '  </mirrors>' \
+          '</settings>' > "${HOME}/.m2/settings.xml"
+      fi
+
+      echo "[hydrate-package-repos] language repo configs written"
+
+# ============================================================================
+# Stacks diagnostic — dumps /tmp/stacks.yml to the job trace AFTER the
+# leaf has written it, so we can see what GitLab actually rendered for
+# `$[[ inputs.stacks ]]`. Keeps Bug A (ci-components#3) post-mortem
+# traceable if a related issue resurfaces.
+#
+# Usage: !reference [".dump-stacks", before_script]
+# ============================================================================
+".dump-stacks":
+  before_script:
+    - |
+      if [ -f /tmp/stacks.yml ]; then
+        echo "=== /tmp/stacks.yml (size: $(wc -c < /tmp/stacks.yml) bytes) ==="
+        cat -A /tmp/stacks.yml || true
+        echo "=== end /tmp/stacks.yml ==="
+      fi
+
+# ============================================================================
+# yq installer — needed to convert YAML stacks blob to JSON for jq use.
+# ============================================================================
+".install-yq":
+  before_script:
+    - |
+      set -euo pipefail
+      if ! command -v yq >/dev/null 2>&1; then
+        YQ_URL="https://harbor.example.com/proxy/github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64"
+        if command -v apk >/dev/null 2>&1; then
+          apk add --no-cache yq >/dev/null 2>&1 || apk add --no-cache curl ca-certificates >/dev/null
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update -qq >/dev/null && apt-get install -qq -y --no-install-recommends curl ca-certificates >/dev/null
+        fi
+        if ! command -v yq >/dev/null 2>&1; then
+          if command -v curl >/dev/null 2>&1; then curl -fsSL -o /usr/local/bin/yq "${YQ_URL}"
+          else wget -q -O /usr/local/bin/yq "${YQ_URL}"
+          fi
+          chmod +x /usr/local/bin/yq
+        fi
+      fi
+
+# ============================================================================
+# Stacks materialization (v4.0.9 redesign).
+#
+# v4.0.8 attempted `variables: STACKS_INPUT: $[[ inputs.stacks ]]` but
+# GitLab rejects array values in variable definitions ("variable
+# definition must be either a string or a hash"). Caught by Gate #2.
+#
+# Back to the heredoc approach but each leaf now MUST also call
+# `.dump-stacks` immediately after, so if anything goes wrong we see
+# the rendered file in the trace (Frank's diagnostic ask from #3).
+#
+# Caller pattern (in each leaf job):
+#   before_script:
+#     - !reference [".fetch-platform-context", before_script]
+#     - !reference [".install-yq", before_script]
+#     - |
+#       cat > /tmp/stacks.yml <<'STACKS_YAML'
+#       $[[ inputs.stacks ]]
+#       STACKS_YAML
+#     - !reference [".dump-stacks", before_script]
+#     - !reference [".convert-stacks-json", before_script]
+# ============================================================================
+".convert-stacks-json":
+  before_script:
+    - |
+      set -euo pipefail
+      # GitLab 18.x renders array-typed inputs in script context as
+      # Ruby Hash inspect format (`:key=>value`), NOT YAML and NOT JSON.
+      # Translate to JSON via sed (pure shell, no python/yq dependency):
+      #   :word=>  ->  "word":
+      #   =>       ->  :        (any remaining => arrows)
+      #   nil      ->  null
+      # Then jq parses + re-serializes for downstream use.
+      sed -E 's/:([A-Za-z_][A-Za-z0-9_]*)=>/"\1":/g; s/=>/:/g; s/\bnil\b/null/g' \
+        /tmp/stacks.yml > /tmp/stacks.json
+      if ! STACKS_JSON=$(jq -c . /tmp/stacks.json 2>&1); then
+        echo "FAIL convert /tmp/stacks.yml -> JSON" >&2
+        echo "--- raw ---" >&2; cat /tmp/stacks.yml >&2
+        echo "--- after sed ---" >&2; cat /tmp/stacks.json >&2
+        exit 1
+      fi
+      export STACKS_JSON
+      echo "export STACKS_JSON='${STACKS_JSON}'" >> /tmp/platform-context.env
+
+# ============================================================================
+# Language-base skip anchors — no-op when the stack is absent from the repo
+# These are legacy aids; v4 prefers explicit stack declaration. Kept for jobs
+# that still want a defensive skip check.
+# ============================================================================
+".python-detect":
+  script:
+    - |
+      if ! find . -type d \( -name .venv -o -name venv -o -name vendor -o -name node_modules -o -name .tox -o -name .git \) -prune -o \
+          \( -name pyproject.toml -o -name setup.py -o -name requirements.txt \) -print -quit | grep -q .; then
+        echo "[python-detect] no python markers, skipping"
+        exit 0
+      fi
+
+".node-detect":
+  script:
+    - |
+      if ! find . -type d \( -name node_modules -o -name dist -o -name vendor -o -name .git \) -prune -o \
+          -name package.json -print -quit | grep -q .; then
+        echo "[node-detect] no typescript/node markers, skipping"
+        exit 0
+      fi
+
+".go-detect":
+  script:
+    - |
+      if ! find . -type d \( -name vendor -o -name .git \) -prune -o \
+          -name go.mod -print -quit | grep -q .; then
+        echo "[go-detect] no go markers, skipping"
+        exit 0
+      fi

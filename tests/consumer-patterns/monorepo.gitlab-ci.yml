@@ -1,0 +1,26 @@
+# Canonical consumer pattern: multi-stack monorepo (forge: core+ui).
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@RC_VERSION
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/pipeline@RC_VERSION
+    inputs:
+      team: smoketest
+      app: svc-monorepo
+      stacks:
+        - name: core
+          language: python
+          paths: ["core/**"]
+          project_dir: core
+          test_paths: [tests]
+          coverage_threshold: 0
+          image_name: core
+          dockerfile: Dockerfile
+          build_context: core
+        - name: ui
+          language: typescript
+          paths: ["ui/**"]
+          project_dir: ui
+          test_command: "npx vitest run --coverage --reporter=junit"
+          coverage_threshold: 0
+          image_name: ui
+          dockerfile: Dockerfile
+          build_context: ui

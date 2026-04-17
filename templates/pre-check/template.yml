@@ -1,0 +1,253 @@
+---
+# pre-check — MinimalCD v4.0.0 leaf component
+#
+# Runs once per pipeline: gitleaks secret scan, commitlint, license headers,
+# and stack-validate (spec §7). No Vault needed.
+
+spec:
+  inputs:
+    stacks:
+      description: "Structured stack declarations (spec §7). Required for stack-validate."
+      type: array
+      default: []
+    ignore_detected:
+      description: "Languages to skip in stack-validate (e.g. [go] when go.mod lives in vendor/)"
+      type: array
+      default: []
+    exclude_paths:
+      description: "Glob paths to exclude from language marker detection"
+      type: array
+      default: []
+    gitleaks_image:
+      description: "gitleaks image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/zricethezav/gitleaks:v8.21.2"
+    commitlint_image:
+      description: "Node image with commitlint. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/node:20-alpine"
+    tool_image:
+      description: "Shell tool image for license-headers and stack-validate"
+      type: string
+      default: "harbor.example.com/docker.io/library/alpine:3.21"
+    runner_tags:
+      description: "Runner tags for light jobs (lint/test/pre-check/promote/deploy-gates)."
+      type: array
+      default: ["shared"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+
+stages: [pre-check]
+
+"pre-check:secrets":
+  stage: pre-check
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.gitleaks_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  script:
+    - |
+      set -euo pipefail
+      # If the consumer ships its own .gitleaks.toml (or .yaml), respect it.
+      # Otherwise auto-detect external-secrets.io CRs (ExternalSecret /
+      # SecretStore / ClusterSecretStore) and allowlist those paths so the
+      # rule that flags "looks-like-a-k8s-Secret-yaml" stops false-positiving
+      # on CRs that only REFERENCE secrets (no secret material on disk).
+      # Reported by forge on ci-components#3 note 3757.
+      if [ -f .gitleaks.toml ] || [ -f .gitleaks.yaml ]; then
+        echo "[pre-check:secrets] using consumer's .gitleaks config"
+        gitleaks detect --source . --verbose --redact --no-banner --exit-code 1
+      else
+        ES_FILES=$(find . -type f \( -name '*.yaml' -o -name '*.yml' \) \
+          -not -path './.git/*' \
+          -exec grep -l -E '^kind:[[:space:]]+(ExternalSecret|SecretStore|ClusterSecretStore)\b' {} + 2>/dev/null \
+          | sort -u | sed 's|^\./||' || true)
+        {
+          echo '[extend]'
+          echo 'useDefault = true'
+          if [ -n "${ES_FILES}" ]; then
+            echo
+            echo '[allowlist]'
+            echo 'description = "external-secrets.io CRs (auto-detected): ExternalSecret/SecretStore/ClusterSecretStore reference secrets, no material on disk"'
+            echo 'paths = ['
+            while IFS= read -r f; do
+              esc=${f//\"/\\\"}
+              printf '  "%s",\n' "${esc}"
+            done <<<"${ES_FILES}"
+            echo ']'
+          fi
+        } > /tmp/gitleaks.toml
+        echo "[pre-check:secrets] auto-detected ExternalSecret-family files:"
+        echo "${ES_FILES:-<none>}" | sed 's/^/  /'
+        gitleaks detect --source . --config /tmp/gitleaks.toml --verbose --redact --no-banner --exit-code 1
+      fi
+
+"pre-check:commitlint":
+  stage: pre-check
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.commitlint_image ]]"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - apk add --no-cache git ca-certificates
+    # Trust the private CA so `git fetch origin` against the internal GitLab
+    # works. The .fetch-platform-context anchor (used by lint/test/build/etc)
+    # already does this from scripts/release-gate/aegisgroup-ca.crt, but
+    # commitlint doesn't chain-include platform, so we inline the cert here.
+    # Reported by forge on ci-components#3 note 3757.
+    - |
+      cat > /usr/local/share/ca-certificates/aegisgroup-ca.crt <<'CERT'
+      -----BEGIN CERTIFICATE-----
+      MIIFkjCCA3qgAwIBAgIUI/qXihl2g5m64Cv/mAQlkL/ZbxQwDQYJKoZIhvcNAQEL
+      BQAwNDEUMBIGA1UECgwLQWVnaXMgR3JvdXAxHDAaBgNVBAMME0FlZ2lzIEdyb3Vw
+      IFJvb3QgQ0EwIBcNMjYwMjIxMjE0NTMzWhgPMjA1NjAyMTQyMTQ1MzNaMDQxFDAS
+      BgNVBAoMC0FlZ2lzIEdyb3VwMRwwGgYDVQQDDBNBZWdpcyBHcm91cCBSb290IENB
+      MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAkKrJFQi2L6xWZVHe5pQa
+      9b7LBnbXsas3l2of6JHw9weTnl7wJefHUcOrcaKUT9SeKL8VVgU4jv3LhPolFQsY
+      2+ibGEAasWorveY34x2oeQIF6LVs6lxwQrm3/Vwvi3jNCKmDGD+n+SPA1+4/jcdc
+      g5PprKptoBQVItec7LT/kVLrrvVEzvwdJ5GqOjDpDSZHUQnimmfWyR6YJVbGZqAq
+      +p/tX/960WLtLEUmXHAi5RWTLpavOyDM1y7CoOtfMi3VlVCPs9hm4dt5Fq9vgTQC
+      xjRE9J8LTl5JfASxPAIcP9E0X29uIVK36hvpib13H/mIWrUNHFuGPTqyvyjNz1MD
+      SMIe6ayVGI1+ng8Xr3LHCpVqPf5buZHl2L33LRE1zmEXIMVG02Ogrk24iW/68frV
+      bG2k1jpZ/I8bbCP+mNp90CjGEZgeQp5gDsJEHp6Cn3XkCF1Th0Idilm5j0Ami3e9
+      uAwGPvuRK4B8x9ROx3aUao76hH4bQNYMPioVIvKjyFhIZO1sBTLJTy3kFmIxCTIP
+      A+NDYsBP0Y2NAf50tk9QzcedJsP7pO9wfS+KTKBxw0uxdml2Zw8u/tPA8X62ug42
+      tOYkSp5STow49Brp5sEywl8dbzU8JXUqAPxvhyetATERNVmUCuHFdaV+MQnVO6QK
+      OtsBYYv3y3gjqx61e2S2jx0CAwEAAaOBmTCBljAPBgNVHRMBAf8EBTADAQH/MA4G
+      A1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU9dv0+9OSsA/xo/t6ZeaupMdFg5MwVAYD
+      VR0eAQH/BEowSKBGMA+CDWFlZ2lzZ3JvdXAuY2gwD4INY2x1c3Rlci5sb2NhbDAK
+      hwgKAAAA/wAAADAKhwisEAAA//AAADAKhwjAqAAA//8AADANBgkqhkiG9w0BAQsF
+      AAOCAgEANB9V/s5k66kgTG27+4b+52wCqI7daDB/eJNQeryka/ojrkxC5p8EGGtO
+      lktWD58jFzmpLpuf1kwhggKDjD1kedri01vrshfx1ckj0a/z02NFvPA9edCxaVJ2
+      ZcGfzjhHuk99XKtC3Pk9x7mwnzxb4HllSzBYKsszsmrhQ/fEnORVwG/9Cl8iL4Z8
+      cUnZZoGNf8SEEsPvVpKEuxnv742mF0kN2k6txe3XxEvZGdgIeBxJDi/aZ1J7h2px
+      t0zurz+vPLDRL3c1oloB2WepfuIGYJiMFQDnnRzVPI2FrA638Kmby/gKtNP9YYhP
+      aKLPZ+SPV0qGE747DVkkHMFbvbl7M/9y64QAPmod22YjGCCT4DKH1UY76zdZdSCV
+      +I1luSuyvHIrisclqpFlp/u1NXgtoR6cwoGJNyASst0klaPKe6T4ba8OYCuhQgEr
+      Lx+q2JT5wz1zPVBkvf07ZfHTHRkO1cvTmD4tOsuntt2v5I1VP/izdSwbowLh91Eh
+      FsIZMPy69KYMRj/UdOWdErbKeLjuHpEmQMG1xfpOCVBbD41m76Dqf31Lwe09lUVZ
+      835iO2x0T+e1vCpjuKrOmZd1I5ReXjvc21DF9DvT9uoevkk9fYR6+48rK2i68fJ0
+      BDBYrJLOPdzmOzpF36/P4Ky25kcG3IaYall075aS2YsjbHUCCDg=
+      -----END CERTIFICATE-----
+      CERT
+    - update-ca-certificates
+    - npm install -g @commitlint/cli @commitlint/config-conventional
+    - 'echo "module.exports = { extends: [''@commitlint/config-conventional''] };" > commitlint.config.js'
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - npx commitlint --from "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}" --to HEAD
+
+"pre-check:license-headers":
+  stage: pre-check
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.tool_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  script:
+    - apk add --no-cache git grep
+    - |
+      set -euo pipefail
+      # Use git ls-files instead of find to avoid a race on K8s ephemeral
+      # volumes where find traverses before all file contents are flushed
+      # post-checkout, causing head to read truncated/empty files
+      # non-deterministically. Reported by forge on ci-components#3 note 3787.
+      FILES=$(git ls-files '*.py' '*.go' '*.ts' '*.js')
+      if [ -z "$FILES" ]; then
+        echo "[license-headers] no source files (*.py/*.go/*.ts/*.js) in repo, skipping"
+        exit 0
+      fi
+      FLAGGED=$(echo "$FILES" \
+        | xargs grep -L -E '(Copyright|SPDX-License-Identifier|Licensed under)' 2>/dev/null || true)
+      if [ -n "$FLAGGED" ]; then
+        echo "License header missing on the following files:"
+        echo "$FLAGGED" | sed 's/^/  /'
+        MISSING=$(echo "$FLAGGED" | wc -l)
+        echo "Total: $MISSING files"
+        exit 1
+      fi
+
+"pre-check:stack-validate":
+  stage: pre-check
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.tool_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  before_script:
+    - apk add --no-cache jq findutils bash
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+      cat > /tmp/ignore.yml <<'IGNORE_YAML'
+      $[[ inputs.ignore_detected ]]
+      IGNORE_YAML
+      cat > /tmp/exclude.yml <<'EXCLUDE_YAML'
+      $[[ inputs.exclude_paths ]]
+      EXCLUDE_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+    - |
+      IGNORE_JSON=$(yq -o=json '.' /tmp/ignore.yml)
+      EXCLUDE_JSON=$(yq -o=json '.' /tmp/exclude.yml)
+      export IGNORE_JSON EXCLUDE_JSON
+  script:
+    - |
+      bash -euo pipefail <<'BASH'
+      DECLARED=$(echo "$STACKS_JSON" | jq -r '[.[].language] | unique | .[]' 2>/dev/null || true)
+      IGNORED=$(echo "$IGNORE_JSON" | jq -r '.[]' 2>/dev/null || true)
+
+      # Build find prune expression
+      PRUNES=( -name .git -o -name vendor -o -name node_modules -o -name .venv -o -name venv -o -name dist -o -name .tox -o -name target )
+      # User-supplied exclusions
+      while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        PRUNES+=( -o -path "./$p" )
+      done < <(echo "$EXCLUDE_JSON" | jq -r '.[]' 2>/dev/null || true)
+
+      DETECTED=""
+      find . -type d \( "${PRUNES[@]}" \) -prune -o -type f \( \
+          -name pyproject.toml -o -name setup.py -o -name requirements.txt \
+          -o -name package.json -o -name go.mod -o -name Cargo.toml \
+          -o -name pom.xml -o -name build.gradle \
+        \) -print | while read -r f; do echo "$(basename "$f")"; done | sort -u > /tmp/markers.txt
+
+      grep -qE 'pyproject.toml|setup.py|requirements.txt' /tmp/markers.txt && DETECTED="$DETECTED python"
+      grep -q 'package.json' /tmp/markers.txt                              && DETECTED="$DETECTED typescript"
+      grep -q 'go.mod' /tmp/markers.txt                                    && DETECTED="$DETECTED go"
+      grep -q 'Cargo.toml' /tmp/markers.txt                                && DETECTED="$DETECTED rust"
+      grep -qE 'pom.xml|build.gradle' /tmp/markers.txt                     && DETECTED="$DETECTED java"
+
+      echo "[stack-validate] declared:  $(echo $DECLARED | tr '\n' ' ')"
+      echo "[stack-validate] detected:  $DETECTED"
+      echo "[stack-validate] ignored:   $(echo $IGNORED | tr '\n' ' ')"
+
+      MISSING=""
+      for d in $DETECTED; do
+        echo "$DECLARED" | grep -qx "$d" && continue
+        echo "$IGNORED"  | grep -qx "$d" && continue
+        MISSING="$MISSING $d"
+      done
+
+      if [ -n "$MISSING" ]; then
+        cat <<EOF
+      ERROR: undeclared language(s) detected:$MISSING
+
+      Add to .gitlab-ci.yml pipeline input 'stacks:' — for example:
+        stacks:
+          - name: core
+            language:$MISSING
+            paths: ["**"]
+            project_dir: "."
+
+      Or silence with ignore_detected: [${MISSING# }]
+      EOF
+        exit 1
+      fi
+
+      # Warn on declared-but-not-found
+      for d in $DECLARED; do
+        if ! echo "$DETECTED" | grep -qw "$d"; then
+          echo "[stack-validate] WARN: declared '$d' but no markers found"
+        fi
+      done
+      echo "[stack-validate] OK"
+      BASH

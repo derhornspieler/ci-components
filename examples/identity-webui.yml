@@ -1,0 +1,17 @@
+# identity-webui — MinimalCD v4.0.0
+# Place at infra_and_platform_services/identity-webui/.gitlab-ci.yml
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/pipeline@4.0.14
+    inputs:
+      team: infra_and_platform_services
+      app: identity-webui
+      stacks:
+        - name: webui
+          language: typescript
+          paths: ["src/**", "package.json"]
+          project_dir: "."
+          coverage_threshold: 75
+          image_name: identity-webui
+          dockerfile: Dockerfile
+          build_context: "."

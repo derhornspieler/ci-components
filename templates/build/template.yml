@@ -1,0 +1,102 @@
+---
+# build — MinimalCD v4.0.0 leaf component
+#
+# One build:<stack.name> job per declared stack. Buildah builds image, tags by
+# $CI_COMMIT_SHA, pushes to harbor_dev_registry (from platform/cluster-context),
+# emits digest artifact at <stack.name>-digest.txt.
+#
+# Harbor robot creds pulled from platform/ci-robots/harbor-dev-push via
+# _vault-auth. Matrix fan-out across stacks.
+
+spec:
+  inputs:
+    stacks:
+      description: "Structured stack declarations (spec §7)"
+      type: array
+      default: []
+    team:
+      description: "Team slug — used as image repo prefix <team>/<image_name>"
+      type: string
+    buildah_image:
+      description: "Buildah image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/quay.io/buildah/stable:v1.38.0"
+    vault_role:
+      description: "Vault JWT role for reading harbor-dev-push robot creds"
+      type: string
+      default: "gitlab-ci"
+    runner_tags:
+      description: "Runner tags for light jobs (fallback/default)."
+      type: array
+      default: ["shared"]
+    heavy_runner_tags:
+      description: "Runner tags for heavy jobs (build:image / scan:image). Defaults to shared+compute."
+      type: array
+      default: ["shared", "compute"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/vault-auth@4.0.14
+    inputs:
+      vault_role: "$[[ inputs.vault_role ]]"
+
+stages: [build]
+
+"build:image":
+  stage: build
+  tags: $[[ inputs.heavy_runner_tags ]]
+  image: "$[[ inputs.buildah_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  variables:
+    TEAM: "$[[ inputs.team ]]"
+    STORAGE_DRIVER: vfs
+    BUILDAH_FORMAT: docker
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".vault-auth-jwt", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - dnf install -y jq curl || microdnf install -y jq curl || apk add --no-cache jq curl
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      # Fetch Harbor dev-push robot creds
+      ROBOT=$(curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" \
+        "${VAULT_ADDR}/v1/kv/data/platform/ci-robots/harbor-dev-push" | jq -r '.data.data')
+      HARBOR_USER=$(echo "$ROBOT" | jq -r '.username')
+      HARBOR_TOKEN=$(echo "$ROBOT" | jq -r '.token')
+      echo "${HARBOR_TOKEN}" | buildah login --username "${HARBOR_USER}" --password-stdin "${HARBOR_DEV_REGISTRY}"
+
+      mkdir -p digests
+
+      LEN=$(echo "$STACKS_JSON" | jq 'length')
+      for i in $(seq 0 $((LEN-1))); do
+        S=$(echo "$STACKS_JSON" | jq ".[$i]")
+        NAME=$(echo "$S" | jq -r '.name')
+        IMG=$(echo "$S" | jq -r '.image_name // .name')
+        DF=$(echo "$S"  | jq -r '.dockerfile // "Dockerfile"')
+        CTX=$(echo "$S" | jq -r '.build_context // .project_dir // "."')
+        FULL="${HARBOR_DEV_REGISTRY}/${TEAM}/${IMG}"
+        TAG="${FULL}:${CI_COMMIT_SHA}"
+        echo "::group::build ${NAME} -> ${TAG}"
+        buildah bud -f "${CTX}/${DF}" -t "${TAG}" "${CTX}"
+        buildah push --digestfile "digests/${NAME}.digest" "${TAG}"
+        DIGEST=$(cat "digests/${NAME}.digest")
+        echo "${FULL}@${DIGEST}" > "digests/${NAME}-digest.txt"
+        echo "[build] ${NAME} digest=${DIGEST}"
+        echo "::endgroup::"
+      done
+  artifacts:
+    when: on_success
+    expire_in: 30 days
+    paths:
+      - digests/

@@ -1,0 +1,109 @@
+---
+# _vault-auth — MinimalCD v4.0.0 shared component
+#
+# Anchors for Vault JWT login and credential fetch (Harbor robot, cosign, SSH).
+# Chain-included by build, scan, promote, deploy-gates — NOT by lint/test/pre-check.
+#
+# All anchors assume .fetch-platform-context has already run, so VAULT_ADDR and
+# VAULT_TOKEN are set in /tmp/platform-context.env.
+
+spec:
+  inputs:
+    vault_role:
+      description: "JWT auth role for CI-facing credential reads"
+      type: string
+      default: "gitlab-ci"
+    vault_id_token_aud:
+      description: "OIDC audience for CI JWT"
+      type: string
+      default: "https://gitlab.example.com"
+---
+
+# ============================================================================
+# .vault-auth-jwt — re-auth with a role that has broader read (ci-robots tree)
+# Call AFTER .fetch-platform-context. Re-issues VAULT_TOKEN with inputs.vault_role.
+# ============================================================================
+".vault-auth-jwt":
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "$[[ inputs.vault_id_token_aud ]]"
+  before_script:
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      LOGIN=$(jq -n --arg role "$[[ inputs.vault_role ]]" --arg jwt "${VAULT_ID_TOKEN}" '{role:$role, jwt:$jwt}')
+      VAULT_TOKEN=$(curl -sf --request POST --data "${LOGIN}" \
+        "${VAULT_ADDR}/v1/auth/jwt/login" | jq -r '.auth.client_token')
+      if [ -z "${VAULT_TOKEN}" ] || [ "${VAULT_TOKEN}" = "null" ]; then
+        echo "[vault-auth-jwt] ERROR: JWT login failed for role $[[ inputs.vault_role ]]"
+        exit 1
+      fi
+      export VAULT_TOKEN
+      echo "export VAULT_TOKEN=${VAULT_TOKEN}" >> /tmp/platform-context.env
+      echo "[vault-auth-jwt] authenticated as role $[[ inputs.vault_role ]]"
+
+# ============================================================================
+# .cosign-sign-auth — fetch cosign signing key + password from
+# platform/cosign/sign and write to /tmp/cosign.key + export COSIGN_PASSWORD.
+# ============================================================================
+".cosign-sign-auth":
+  before_script:
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      DATA=$(curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" \
+        "${VAULT_ADDR}/v1/kv/data/platform/cosign/sign" | jq -r '.data.data')
+
+      echo "${DATA}" | jq -r '.private_key_b64' | base64 -d > /tmp/cosign.key
+      chmod 600 /tmp/cosign.key
+      COSIGN_PASSWORD=$(echo "${DATA}" | jq -r '.password')
+      export COSIGN_PASSWORD
+      echo "export COSIGN_PASSWORD='${COSIGN_PASSWORD}'" >> /tmp/platform-context.env
+      echo "[cosign-sign-auth] signing key materialized at /tmp/cosign.key"
+
+# ============================================================================
+# .cosign-verify-auth — fetch cosign public key from platform/cosign/public
+# and write to /tmp/cosign.pub. No password needed.
+# ============================================================================
+".cosign-verify-auth":
+  before_script:
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" \
+        "${VAULT_ADDR}/v1/kv/data/${COSIGN_VERIFY_KEY_PATH}" \
+        | jq -r '.data.data.public_key' > /tmp/cosign.pub
+      [ -s /tmp/cosign.pub ] || { echo "[cosign-verify-auth] ERROR: empty public key"; exit 1; }
+      echo "[cosign-verify-auth] public key at /tmp/cosign.pub"
+
+# ============================================================================
+# .ssh-deploy-key-setup — fetch SSH deploy key from
+# platform/ci-robots/app-deployments-deploy and configure ssh-agent.
+# ============================================================================
+".ssh-deploy-key-setup":
+  before_script:
+    - |
+      set -euo pipefail
+      # shellcheck disable=SC1091
+      source /tmp/platform-context.env
+
+      command -v ssh-agent >/dev/null 2>&1 || { apk add --no-cache openssh-client >/dev/null 2>&1 || apt-get update -qq && apt-get install -y -qq openssh-client; }
+
+      DATA=$(curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" \
+        "${VAULT_ADDR}/v1/kv/data/platform/ci-robots/app-deployments-deploy" | jq -r '.data.data')
+
+      mkdir -p "${HOME}/.ssh"
+      echo "${DATA}" | jq -r '.ssh_private_key_b64' | base64 -d > "${HOME}/.ssh/id_deploy"
+      chmod 600 "${HOME}/.ssh/id_deploy"
+      echo "${DATA}" | jq -r '.known_hosts' > "${HOME}/.ssh/known_hosts"
+      chmod 644 "${HOME}/.ssh/known_hosts"
+
+      eval "$(ssh-agent -s)"
+      ssh-add "${HOME}/.ssh/id_deploy"
+      echo "[ssh-deploy-key-setup] deploy key loaded into ssh-agent"

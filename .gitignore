@@ -1,0 +1,3 @@
+
+# Operational state for scripts/gitlab-ops/ — append-only audit log
+scripts/gitlab-ops/tracked_items_history.jsonl

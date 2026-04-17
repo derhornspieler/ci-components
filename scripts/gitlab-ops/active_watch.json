@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "platform_users": [
+    "admin.user"
+  ],
+  "items": [
+    {
+      "type": "issue",
+      "repo": "continuous-delivery/ci-components",
+      "iid": 3,
+      "title": "v4.0.7: $[[ inputs.stacks ]] heredoc produces unparseable YAML; bitnet MR pipelines stopped firing",
+      "added_at": "2026-04-15T13:00:00Z",
+      "added_reason": "fresh thread after #1 was closed prematurely",
+      "last_seen_note_id": 3456,
+      "other_team_users": [
+        "dev.user"
+      ]
+    }
+  ],
+  "watched_repos_for_new_issues": [
+    "continuous-delivery/ci-components"
+  ]
+}

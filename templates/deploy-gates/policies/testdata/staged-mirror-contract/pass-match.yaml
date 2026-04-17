@@ -1,0 +1,36 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc
+  namespace: staged-forge
+spec:
+  replicas: 3
+  template:
+    spec:
+      nodeSelector:
+        workload: general
+      containers:
+        - name: app
+          image: harbor.example.com/forge/svc@sha256:aaa
+          resources:
+            requests: {cpu: "200m", memory: "256Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc
+  namespace: forge
+spec:
+  replicas: 3
+  template:
+    spec:
+      nodeSelector:
+        workload: general
+      containers:
+        - name: app
+          image: harbor.example.com/forge/svc@sha256:aaa
+          resources:
+            requests: {cpu: "200m", memory: "256Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}

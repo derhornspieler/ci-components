@@ -1,0 +1,19 @@
+# Canonical consumer pattern: single-stack Python service.
+# The `@RC_VERSION` placeholder is replaced at smoketest time with the
+# ephemeral release-candidate tag (e.g. rc-abc1234).
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@RC_VERSION
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/pipeline@RC_VERSION
+    inputs:
+      team: smoketest
+      app: svc-py
+      stacks:
+        - name: core
+          language: python
+          paths: ["**"]
+          project_dir: "."
+          test_paths: [tests]
+          coverage_threshold: 0
+          image_name: svc-py
+          dockerfile: Dockerfile
+          build_context: "."

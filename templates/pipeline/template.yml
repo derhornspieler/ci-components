@@ -1,0 +1,108 @@
+---
+# pipeline — MinimalCD v4.0.0 aggregate component
+#
+# "Give me the whole app pipeline." Chain-includes all 7 leaf components and
+# wires stage ordering + needs: dependencies.
+#
+# Most consumers include only platform + pipeline. Advanced consumers can
+# include leaf components directly for granular control.
+
+spec:
+  inputs:
+    team:
+      description: "Team slug"
+      type: string
+    app:
+      description: "App slug"
+      type: string
+    stacks:
+      description: "Structured stack declarations (spec §7)"
+      type: array
+      default: []
+    default_coverage_threshold:
+      description: "Fallback coverage threshold (%) when stack omits one"
+      type: number
+      default: 80
+    ignore_detected:
+      description: "Languages to skip in pre-check:stack-validate"
+      type: array
+      default: []
+    exclude_paths:
+      description: "Globs excluded from language marker detection"
+      type: array
+      default: []
+    vault_role:
+      description: "Vault JWT role for ci-robots + cosign creds"
+      type: string
+      default: "gitlab-ci"
+    runner_tags:
+      description: "Runner tags for light jobs (lint/test/pre-check/promote/deploy-gates). Must match at least one online runner in your cluster."
+      type: array
+      default: ["shared"]
+    heavy_runner_tags:
+      description: "Runner tags for heavy jobs (build:image / scan:image). Defaults to shared+compute so multi-GB container builds steer to compute-pool runners."
+      type: array
+      default: ["shared", "compute"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/pre-check@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      ignore_detected: "$[[ inputs.ignore_detected ]]"
+      exclude_paths: "$[[ inputs.exclude_paths ]]"
+      runner_tags: "$[[ inputs.runner_tags ]]"
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/lint@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      runner_tags: "$[[ inputs.runner_tags ]]"
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/test@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      default_coverage_threshold: "$[[ inputs.default_coverage_threshold ]]"
+      runner_tags: "$[[ inputs.runner_tags ]]"
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/build@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      team: "$[[ inputs.team ]]"
+      vault_role: "$[[ inputs.vault_role ]]"
+      heavy_runner_tags: "$[[ inputs.heavy_runner_tags ]]"
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/scan@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      team: "$[[ inputs.team ]]"
+      vault_role: "$[[ inputs.vault_role ]]"
+      heavy_runner_tags: "$[[ inputs.heavy_runner_tags ]]"
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/promote@4.0.14
+    inputs:
+      stacks: "$[[ inputs.stacks ]]"
+      team: "$[[ inputs.team ]]"
+      app: "$[[ inputs.app ]]"
+      vault_role: "$[[ inputs.vault_role ]]"
+      runner_tags: "$[[ inputs.runner_tags ]]"
+
+stages:
+  - pre-check
+  - lint
+  - test
+  - build
+  - scan
+  - promote
+
+# needs wiring — build depends on lint+test pass, scan depends on build,
+# promote depends on scan. We attach needs via extends overrides below.
+"build:image":
+  needs:
+    - job: "pre-check:stack-validate"
+    - job: "lint:python"
+      optional: true
+    - job: "lint:typescript"
+      optional: true
+    - job: "lint:go"
+      optional: true
+    - job: "test:python"
+      optional: true
+    - job: "test:typescript"
+      optional: true
+    - job: "test:go"
+      optional: true

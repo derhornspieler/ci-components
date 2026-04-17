@@ -1,0 +1,192 @@
+---
+# test — MinimalCD v4.0.0 leaf component
+#
+# One job per language. Loops over declared stacks, runs tests with per-stack
+# coverage_threshold enforcement. No Vault needed.
+
+spec:
+  inputs:
+    stacks:
+      description: "Structured stack declarations (spec §7)"
+      type: array
+      default: []
+    default_coverage_threshold:
+      description: "Fallback coverage threshold (%) when stack entry omits one"
+      type: number
+      default: 80
+    python_image:
+      description: "Python image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/python:3.12-alpine"
+    node_image:
+      description: "Node image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/node:20-alpine"
+    go_image:
+      description: "Go image. TODO ADR-5: pin @sha256:..."
+      type: string
+      default: "harbor.example.com/docker.io/library/golang:1.23-alpine"
+    runner_tags:
+      description: "Runner tags for light jobs (lint/test/pre-check/promote/deploy-gates)."
+      type: array
+      default: ["shared"]
+---
+
+include:
+  - component: $CI_SERVER_FQDN/continuous-delivery/ci-components/platform@4.0.14
+
+stages: [test]
+
+"test:python":
+  stage: test
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.python_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  variables:
+    DEFAULT_COV: "$[[ inputs.default_coverage_threshold ]]"
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq bash gcc musl-dev libffi-dev
+    - pip install --quiet pytest pytest-cov coverage
+    - |
+      bash -euo pipefail <<'BASH'
+      LEN=$(echo "$STACKS_JSON" | jq '[.[] | select(.language=="python")] | length')
+      [ "$LEN" = "0" ] && { echo "[test:python] no python stacks, exit OK"; exit 0; }
+      for i in $(seq 0 $((LEN-1))); do
+        S=$(echo "$STACKS_JSON" | jq ".[] | select(.language==\"python\") | [.] | .[$i]")
+        NAME=$(echo "$S" | jq -r '.name')
+        DIR=$(echo "$S" | jq -r '.project_dir')
+        COV=$(echo "$S" | jq -r ".coverage_threshold // ${DEFAULT_COV}")
+        EXTRAS=$(echo "$S" | jq -r '.install_extras // ""')
+        TEST_PATHS=$(echo "$S" | jq -r '(.test_paths // ["tests"]) | join(" ")')
+        echo "::group::test:python $NAME ($DIR, cov>=${COV})"
+        cd "$DIR"
+        if [ -f pyproject.toml ]; then
+          if [ -n "$EXTRAS" ]; then pip install --quiet -e ".[${EXTRAS}]"; else pip install --quiet -e .; fi
+        elif [ -f requirements.txt ]; then
+          pip install --quiet -r requirements.txt
+        fi
+        mkdir -p ../test-reports ../coverage
+        pytest $TEST_PATHS --cov=. --cov-report=xml:"../coverage/coverage-${NAME}.xml" \
+          --junitxml="../test-reports/junit-${NAME}.xml" --cov-fail-under="$COV"
+        cd - >/dev/null
+        echo "::endgroup::"
+      done
+      BASH
+  artifacts:
+    when: always
+    expire_in: 14 days
+    reports:
+      junit: "test-reports/junit-*.xml"
+      coverage_report:
+        coverage_format: cobertura
+        path: "coverage/coverage-*.xml"
+    paths:
+      - test-reports/
+      - coverage/
+
+"test:typescript":
+  stage: test
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.node_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  variables:
+    DEFAULT_COV: "$[[ inputs.default_coverage_threshold ]]"
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq bash
+    - |
+      bash -euo pipefail <<'BASH'
+      LEN=$(echo "$STACKS_JSON" | jq '[.[] | select(.language=="typescript")] | length')
+      [ "$LEN" = "0" ] && { echo "[test:typescript] no typescript stacks, exit OK"; exit 0; }
+      for i in $(seq 0 $((LEN-1))); do
+        S=$(echo "$STACKS_JSON" | jq ".[] | select(.language==\"typescript\") | [.] | .[$i]")
+        NAME=$(echo "$S" | jq -r '.name')
+        DIR=$(echo "$S" | jq -r '.project_dir')
+        CMD=$(echo "$S" | jq -r '.test_command // "npx vitest run --coverage --reporter=junit"')
+        COV=$(echo "$S" | jq -r ".coverage_threshold // ${DEFAULT_COV}")
+        echo "::group::test:typescript $NAME ($DIR, cov>=${COV})"
+        (
+          cd "$DIR"
+          if [ -f package-lock.json ]; then
+            npm ci --prefer-offline
+          else
+            echo "[test:typescript] no package-lock.json in $DIR, falling back to npm install"
+            npm install --prefer-offline --no-audit --no-fund
+          fi
+          eval "$CMD"
+        )
+        echo "::endgroup::"
+      done
+      BASH
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - "**/junit*.xml"
+      - "**/coverage/"
+
+"test:go":
+  stage: test
+  tags: $[[ inputs.runner_tags ]]
+  image: "$[[ inputs.go_image ]]"
+  rules: !reference [".rules-on-mr-and-main", rules]
+  variables:
+    DEFAULT_COV: "$[[ inputs.default_coverage_threshold ]]"
+  before_script:
+    - !reference [".fetch-platform-context", before_script]
+    - !reference [".hydrate-package-repos", before_script]
+    - !reference [".install-yq", before_script]
+    - |
+      cat > /tmp/stacks.yml <<'STACKS_YAML'
+      $[[ inputs.stacks ]]
+      STACKS_YAML
+    - !reference [".dump-stacks", before_script]
+    - !reference [".convert-stacks-json", before_script]
+  script:
+    - apk add --no-cache curl jq bash git
+    - |
+      bash -euo pipefail <<'BASH'
+      LEN=$(echo "$STACKS_JSON" | jq '[.[] | select(.language=="go")] | length')
+      [ "$LEN" = "0" ] && { echo "[test:go] no go stacks, exit OK"; exit 0; }
+      mkdir -p coverage test-reports
+      for i in $(seq 0 $((LEN-1))); do
+        S=$(echo "$STACKS_JSON" | jq ".[] | select(.language==\"go\") | [.] | .[$i]")
+        NAME=$(echo "$S" | jq -r '.name')
+        DIR=$(echo "$S" | jq -r '.project_dir // "."')
+        COV=$(echo "$S" | jq -r ".coverage_threshold // ${DEFAULT_COV}")
+        echo "::group::test:go $NAME ($DIR, cov>=${COV})"
+        (
+          cd "$DIR"
+          go test -race -coverprofile="/builds/coverage/cover-${NAME}.out" ./...
+          PCT=$(go tool cover -func="/builds/coverage/cover-${NAME}.out" | awk '/total:/ {print $3}' | tr -d '%')
+          echo "[test:go] $NAME coverage=${PCT}% threshold=${COV}%"
+          awk -v p="$PCT" -v t="$COV" 'BEGIN{exit !(p+0 >= t+0)}' || { echo "FAIL: coverage below threshold"; exit 1; }
+        )
+        echo "::endgroup::"
+      done
+      BASH
+  artifacts:
+    when: always
+    expire_in: 14 days
+    paths:
+      - coverage/
+      - test-reports/
